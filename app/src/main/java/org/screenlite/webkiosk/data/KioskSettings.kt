@@ -15,4 +15,6 @@ interface KioskSettings {
     suspend fun setIdleBrightness(brightness: Int)
     fun getActiveBrightness(): Flow<Int>
     suspend fun setActiveBrightness(brightness: Int)
+    fun getScreenName(): Flow<String>
+    suspend fun setScreenName(name: String)
 }

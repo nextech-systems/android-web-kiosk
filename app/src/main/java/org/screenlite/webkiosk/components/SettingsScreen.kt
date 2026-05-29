@@ -28,6 +28,7 @@ fun SettingsScreen() {
     val kioskSettings = remember { KioskSettingsFactory.get(context) }
 
     var kioskUrl by remember { mutableStateOf("") }
+    var screenName by remember { mutableStateOf("") }
     var checkIntervalSeconds by remember { mutableStateOf("") }
     var rotation by remember { mutableStateOf(Rotation.ROTATION_0) }
     var idleTimeout by remember { mutableStateOf("") }
@@ -44,6 +45,7 @@ fun SettingsScreen() {
 
     LaunchedEffect(Unit) {
         kioskUrl = kioskSettings.getStartUrl().first()
+        screenName = kioskSettings.getScreenName().first()
         checkIntervalSeconds = (kioskSettings.getCheckInterval().first() / 1000).toString()
         rotation = kioskSettings.getRotation().first()
         idleTimeout = kioskSettings.getIdleTimeout().first().toString()
@@ -82,6 +84,8 @@ fun SettingsScreen() {
                 0 -> GeneralSettingsTab(
                     kioskUrl = kioskUrl,
                     onKioskUrlChange = { kioskUrl = it },
+                    screenName = screenName,
+                    onScreenNameChange = { screenName = it },
                     checkIntervalSeconds = checkIntervalSeconds,
                     onCheckIntervalChange = { checkIntervalSeconds = it },
                     checkIntervalError = checkIntervalError,
@@ -142,6 +146,7 @@ fun SettingsScreen() {
                         (context as? ComponentActivity)?.lifecycleScope?.launch {
                             kioskSettings.setCheckInterval(checkIntervalValue!! * 1000L)
                             kioskSettings.setStartUrl(kioskUrl)
+                            kioskSettings.setScreenName(screenName)
                             kioskSettings.setRotation(rotation)
                             kioskSettings.setIdleTimeout(idleTimeoutValue!!)
                             kioskSettings.setIdleBrightness(idleBrightnessValue!!)
@@ -162,6 +167,8 @@ fun SettingsScreen() {
 fun GeneralSettingsTab(
     kioskUrl: String,
     onKioskUrlChange: (String) -> Unit,
+    screenName: String,
+    onScreenNameChange: (String) -> Unit,
     checkIntervalSeconds: String,
     onCheckIntervalChange: (String) -> Unit,
     checkIntervalError: String?,
@@ -182,6 +189,17 @@ fun GeneralSettingsTab(
             onValueChange = onKioskUrlChange,
             placeholder = stringResource(R.string.settings_kiosk_url_placeholder),
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri)
+        )
+
+        Spacer(Modifier.height(32.dp))
+
+        SettingsField(
+            label = stringResource(R.string.settings_screen_name_label),
+            description = stringResource(R.string.settings_screen_name_desc),
+            value = screenName,
+            onValueChange = onScreenNameChange,
+            placeholder = stringResource(R.string.settings_screen_name_placeholder),
+            keyboardOptions = KeyboardOptions.Default
         )
 
         Spacer(Modifier.height(32.dp))

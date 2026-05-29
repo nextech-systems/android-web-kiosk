@@ -11,6 +11,7 @@ class RotatedWebView @JvmOverloads constructor(
 ) : WebView(context, attrs, defStyleAttr) {
     var appliedRotation: Float = 0f
         set(value) {
+            if (field == value) return  // skip no-op — prevents spurious requestLayout during load
             field = value
             rotation = value
             requestLayout()
@@ -27,8 +28,15 @@ class RotatedWebView @JvmOverloads constructor(
         val parentHeight = MeasureSpec.getSize(heightMeasureSpec)
 
         if (appliedRotation % 180f == 0f) {
+            // Normal orientation — let super run with the real specs so the renderer
+            // gets its internal layout pass, then confirm our dimensions.
+            super.onMeasure(widthMeasureSpec, heightMeasureSpec)
             setMeasuredDimension(parentWidth, parentHeight)
         } else {
+            // 90/270° — swap width/height so the rotated content fills the screen.
+            val swappedW = MeasureSpec.makeMeasureSpec(parentHeight, MeasureSpec.EXACTLY)
+            val swappedH = MeasureSpec.makeMeasureSpec(parentWidth, MeasureSpec.EXACTLY)
+            super.onMeasure(swappedW, swappedH)
             setMeasuredDimension(parentHeight, parentWidth)
         }
     }

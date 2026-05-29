@@ -64,6 +64,7 @@ dependencies {
     implementation(libs.androidx.foundation)
     implementation(libs.androidx.leanback)
     implementation(libs.androidx.datastore.preferences)
+    implementation("androidx.webkit:webkit:1.11.0")
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.ui.test.junit4)
     debugImplementation(libs.androidx.ui.tooling)

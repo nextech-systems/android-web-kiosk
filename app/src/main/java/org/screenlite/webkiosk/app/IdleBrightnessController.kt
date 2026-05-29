@@ -54,6 +54,10 @@ class IdleBrightnessController(
         handler.removeCallbacks(checkIdleRunnable)
         setBrightness(activeBrightness)
         _isIdleMode.value = false
+        if (idleTimeout == 0L) {
+            Log.d(TAG, "Idle timeout disabled (0) — not scheduling idle runnable")
+            return
+        }
         Log.d(
             TAG,
             "Idle timer reset → switching to active brightness: $activeBrightness% (next idle in ${idleTimeout}ms)"

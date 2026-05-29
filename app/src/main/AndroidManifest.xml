@@ -8,6 +8,11 @@
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+
+    <queries>
+        <package android:name="org.screenlite.sdm" />
+    </queries>
 
     <uses-feature
         android:name="android.software.leanback"
@@ -39,6 +44,14 @@
             </intent-filter>
         </receiver>
 
+        <receiver
+            android:name=".receiver.ConfigReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="org.screenlite.webkiosk.SET_CONFIG" />
+            </intent-filter>
+        </receiver>
+
         <service
             android:name=".service.StayOnTopService"
             android:enabled="true"
@@ -52,7 +65,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:configChanges="orientation|screenSize"
+            android:configChanges="orientation|screenSize|keyboardHidden|keyboard|screenLayout|uiMode|density"
             android:focusable="true"
             android:focusableInTouchMode="true"
             android:windowSoftInputMode="adjustResize|stateHidden">

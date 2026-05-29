@@ -14,6 +14,7 @@ class SharedPreferencesKioskSettings(context: Context) : KioskSettings {
     private val keyIdleTimeout = "idle_timeout"
     private val keyIdleBrightness = "idle_brightness"
     private val keyActiveBrightness = "active_brightness"
+    private val keyScreenName = "screen_name"
 
     override fun getCheckInterval(): Flow<Long> = callbackFlow {
         val key = "check_interval"
@@ -80,10 +81,10 @@ class SharedPreferencesKioskSettings(context: Context) : KioskSettings {
 
     override fun getIdleTimeout(): Flow<Long> = callbackFlow {
         val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, changedKey ->
-            if (changedKey == keyIdleTimeout) trySend(prefs.getLong(keyIdleTimeout, 60L))
+            if (changedKey == keyIdleTimeout) trySend(prefs.getLong(keyIdleTimeout, 0L))
         }
         prefs.registerOnSharedPreferenceChangeListener(listener)
-        trySend(prefs.getLong(keyIdleTimeout, 60L))
+        trySend(prefs.getLong(keyIdleTimeout, 0L))
         awaitClose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
     }.distinctUntilChanged()
 
@@ -115,5 +116,18 @@ class SharedPreferencesKioskSettings(context: Context) : KioskSettings {
 
     override suspend fun setActiveBrightness(brightness: Int) {
         prefs.edit { putInt(keyActiveBrightness, brightness.coerceIn(0, 100)) }
+    }
+
+    override fun getScreenName(): Flow<String> = callbackFlow {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, changedKey ->
+            if (changedKey == keyScreenName) trySend(prefs.getString(keyScreenName, "") ?: "")
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        trySend(prefs.getString(keyScreenName, "") ?: "")
+        awaitClose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }.distinctUntilChanged()
+
+    override suspend fun setScreenName(name: String) {
+        prefs.edit { putString(keyScreenName, name) }
     }
 }

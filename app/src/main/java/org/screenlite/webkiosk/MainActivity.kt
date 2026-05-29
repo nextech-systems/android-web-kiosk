@@ -10,6 +10,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
@@ -45,8 +47,27 @@ class MainActivity : ComponentActivity() {
     private lateinit var unlockHandler: TapUnlockHandler
     lateinit var idleController: IdleBrightnessController
 
+    companion object {
+        // Process-level cache so activity restarts due to config changes
+        // (e.g. keyboard appearing) can recover the URL without a new intent
+        var cachedIntentUrl: String? = null
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Prefer the URL from the incoming intent; fall back to the process-level
+        // cache so config-change restarts don't lose the URL.
+        val intentUrl = intent.getStringExtra("start_url")?.takeIf { it.isNotBlank() }
+            ?: cachedIntentUrl
+
+        if (intentUrl != null) {
+            cachedIntentUrl = intentUrl
+            Log.i("MainActivity", "Applying start_url from intent: $intentUrl")
+            lifecycleScope.launch {
+                KioskSettingsFactory.get(this@MainActivity).setStartUrl(intentUrl)
+            }
+        }
 
         FullScreenHelper.enableImmersiveMode(this.window)
         StayOnTopServiceStarter.ensureRunning(this)
@@ -60,8 +81,18 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             ScreenliteWebKioskTheme {
-                AppContent(unlockHandler, this)
+                AppContent(unlockHandler, this, intentUrl)
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        val url = intent.getStringExtra("start_url")?.takeIf { it.isNotBlank() } ?: return
+        cachedIntentUrl = url
+        Log.i("MainActivity", "Applying start_url from onNewIntent: $url")
+        lifecycleScope.launch {
+            KioskSettingsFactory.get(this@MainActivity).setStartUrl(url)
         }
     }
 
@@ -74,6 +105,17 @@ class MainActivity : ComponentActivity() {
         startActivity(Intent(this, SettingsActivity::class.java))
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            // Re-apply immersive mode whenever the window regains focus.
+            // System bars can reappear temporarily (e.g. after StayOnTopService brings
+            // the app back, or after a dialog/notification). This ensures they always
+            // get re-hidden without requiring a full activity restart.
+            FullScreenHelper.enableImmersiveMode(window)
+        }
+    }
+
     override fun onPause() {
         super.onPause()
         idleController.stop()
@@ -82,11 +124,12 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         idleController.start()
+        FullScreenHelper.enableImmersiveMode(window)
     }
 }
 
 @Composable
-fun AppContent(unlockHandler: TapUnlockHandler, activity: Activity) {
+fun AppContent(unlockHandler: TapUnlockHandler, activity: Activity, intentUrl: String? = null) {
     val context = LocalContext.current
     val idleController = remember { (activity as MainActivity).idleController }
     val isIdleMode by idleController.isIdleMode.collectAsState()
@@ -110,7 +153,7 @@ fun AppContent(unlockHandler: TapUnlockHandler, activity: Activity) {
     val isTv = isTvDevice()
 
     Box(Modifier.fillMaxSize().background(Color.White)) {
-        MainScreen(activity = activity, modifier = Modifier.fillMaxSize())
+        MainScreen(activity = activity, modifier = Modifier.fillMaxSize(), intentUrl = intentUrl)
 
         if(isTv) {
             TvKioskInputOverlay(onTap = {

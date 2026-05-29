@@ -7,6 +7,10 @@
     <string name="settings_kiosk_url_desc">This is the only webpage shown in kiosk mode.</string>
     <string name="settings_kiosk_url_placeholder">https://screenlite.org</string>
 
+    <string name="settings_screen_name_label">Screen Name</string>
+    <string name="settings_screen_name_desc">A unique identifier for this device (e.g. "Lobby Display"). Used by remote config.</string>
+    <string name="settings_screen_name_placeholder">e.g., Lobby Display</string>
+
     <string name="settings_check_interval_label">App Check Interval (seconds)</string>
     <string name="settings_check_interval_desc">How often the service verifies the kiosk is active. If closed, it restarts automatically.</string>
     <string name="settings_check_interval_placeholder">e.g., 30</string>

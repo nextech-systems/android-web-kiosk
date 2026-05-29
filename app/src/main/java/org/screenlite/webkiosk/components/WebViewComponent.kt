@@ -7,6 +7,8 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import org.screenlite.webkiosk.app.WebViewManager
 import androidx.compose.runtime.Composable
@@ -23,8 +25,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import org.screenlite.webkiosk.data.KioskSettingsFactory
 import org.screenlite.webkiosk.data.Rotation
-import androidx.compose.ui.platform.LocalConfiguration
-import android.content.res.Configuration
 
 private const val TAG = "WebViewComponent"
 
@@ -64,22 +64,24 @@ fun WebViewComponent(
         )
     }
 
-    val configuration = LocalConfiguration.current
-    LaunchedEffect(configuration.orientation) {
-        val orientation =
-            if (configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) "LANDSCAPE"
-            else "PORTRAIT"
-
-        Log.d(TAG, "Device orientation changed: $orientation")
-        webViewManager.updateRotation(rotation)
-    }
-
     LaunchedEffect(Unit) {
         val kioskSettings = KioskSettingsFactory.get(context)
         kioskSettings.getRotation().collect { newRotation ->
             Log.d(TAG, "Rotation updated: $newRotation")
             rotation = newRotation
             webViewManager.updateRotation(newRotation)
+        }
+    }
+
+    // Fallback: if onPageFinished hasn't fired within 20 seconds (e.g. Vite dev-mode
+    // pages keep window.onload pending), force the WebView visible so content shows.
+    LaunchedEffect(isLoading, hasLoadedPage) {
+        if (isLoading && !hasLoadedPage) {
+            delay(20_000)
+            if (isLoading && !hasLoadedPage && !hasError) {
+                Log.w(TAG, "Load timeout — forcing WebView visible")
+                webViewManager.forceShow()
+            }
         }
     }
 
@@ -97,22 +99,33 @@ fun WebViewComponent(
     }
 
     DisposableEffect(Unit) {
+        val mainHandler = Handler(Looper.getMainLooper())
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val callback = object : ConnectivityManager.NetworkCallback() {
+            // ConnectivityManager callbacks fire on a background ConnectivityThread.
+            // WebView methods and Compose state writes MUST run on the main thread —
+            // failure to do so causes a fatal "WebView called on wrong thread" crash.
             override fun onAvailable(network: Network) {
-                Log.d(TAG, "Network available")
-                if (hasError) {
-                    hasError = false
-                    retryTrigger++
-                    Log.d(TAG, "Recovered from error, retryTrigger=$retryTrigger")
+                mainHandler.post {
+                    Log.d(TAG, "Network available — going online")
+                    webViewManager.setOfflineMode(false)
+                    if (hasError) {
+                        hasError = false
+                        retryTrigger++
+                        Log.d(TAG, "Recovered from error, retryTrigger=$retryTrigger")
+                    }
                 }
             }
 
             override fun onLost(network: Network) {
-                Log.d(TAG, "Network lost")
-                if (!isLoading && !hasLoadedPage) {
-                    Log.e(TAG, "Connection lost before page loaded")
-                    hasError = true
+                mainHandler.post {
+                    Log.d(TAG, "Network lost — switching to cache-only mode")
+                    webViewManager.setOfflineMode(true)
+                    // If we never successfully loaded a page, still show the retry UI
+                    if (!hasLoadedPage) {
+                        Log.e(TAG, "Connection lost before page loaded — will retry when network returns")
+                        hasError = true
+                    }
                 }
             }
         }
@@ -132,43 +145,46 @@ fun WebViewComponent(
             cm.unregisterNetworkCallback(callback)
         }
     }
-    key(retryTrigger) {
-        AndroidView(
-            modifier = modifier,
-            factory = { ctx ->
-                Log.d(TAG, "Creating WebView (rotation=$rotation)")
-                webViewManager.createWebView(rotation)
-            },
-            update = { webView ->
-                if (webView.url != url) {
-                    Log.d(TAG, "Loading new URL: $url")
-                    webView.loadUrl(url)
-                } else if (retryTrigger > 0 && !hasLoadedPage) {
-                    Log.d(TAG, "Retry triggered, reloading WebView")
-                    webView.reload()
-                }
-            })
-    }
-
-    when {
-        hasError -> Box(
-            Modifier
-                .fillMaxSize()
-                .background(Color.Black),
-            contentAlignment = Alignment.Center
-        ) {
-            Log.w(TAG, "Showing connection error UI")
-            Text("Connection error\nRetrying...", color = Color.White)
+    // Explicit Box so the loading/error overlay is guaranteed to stack on top of the WebView.
+    Box(modifier = modifier) {
+        key(retryTrigger) {
+            AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { ctx ->
+                    Log.d(TAG, "Creating WebView (rotation=$rotation)")
+                    webViewManager.createWebView(rotation)
+                },
+                update = { webView ->
+                    if (webView.url != url) {
+                        Log.d(TAG, "Loading new URL: $url")
+                        webView.loadUrl(url)
+                    } else if (retryTrigger > 0 && !hasLoadedPage) {
+                        Log.d(TAG, "Retry triggered, reloading WebView")
+                        webView.reload()
+                    }
+                })
         }
 
-        isLoading -> Box(
-            Modifier
-                .fillMaxSize()
-                .background(Color.Black),
-            contentAlignment = Alignment.Center
-        ) {
-            Log.d(TAG, "Showing loading UI")
-            Text("Loading...", color = Color.White)
+        when {
+            hasError -> Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Color.Black),
+                contentAlignment = Alignment.Center
+            ) {
+                Log.w(TAG, "Showing connection error UI")
+                Text("Connection error\nRetrying...", color = Color.White)
+            }
+
+            isLoading -> Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Color.Black),
+                contentAlignment = Alignment.Center
+            ) {
+                Log.d(TAG, "Showing loading UI")
+                Text("Loading...", color = Color.White)
+            }
         }
     }
 }
