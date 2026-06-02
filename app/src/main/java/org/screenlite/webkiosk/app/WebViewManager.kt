@@ -23,6 +23,27 @@ class WebViewManager(
 ) {
     private var currentWebView: WebView? = null
     private var isOfflineMode = false
+    private var isSilentReload = false
+
+    // Called when a silent reload completes — lets WebViewComponent remove the snapshot overlay
+    var onSilentReloadComplete: () -> Unit = {}
+
+    /**
+     * Captures the current WebView frame as a bitmap so it can be shown as an
+     * overlay while a silent reload happens behind it.
+     */
+    fun captureSnapshot(): Bitmap? {
+        val webView = currentWebView ?: return null
+        return try {
+            val bitmap = Bitmap.createBitmap(webView.width, webView.height, Bitmap.Config.ARGB_8888)
+            val canvas = android.graphics.Canvas(bitmap)
+            webView.draw(canvas)
+            bitmap
+        } catch (e: Exception) {
+            Log.w("WebViewManager", "Snapshot capture failed: ${e.message}")
+            null
+        }
+    }
 
     fun setOfflineMode(offline: Boolean) {
         val wasOffline = isOfflineMode
@@ -129,6 +150,24 @@ class WebViewManager(
         }
     }
 
+    /**
+     * Reload the current page, bypassing the cache so fresh playlist/content
+     * changes from the server are always fetched.
+     */
+    fun reload() {
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            currentWebView?.let { webView ->
+                Log.i("WebViewManager", "Polling reload — clearing cache and reloading (silent)")
+                isSilentReload = true
+                webView.settings.cacheMode = WebSettings.LOAD_NO_CACHE
+                webView.reload()
+                webView.postDelayed({
+                    webView.settings.cacheMode = WebSettings.LOAD_DEFAULT
+                }, 3000)
+            }
+        }
+    }
+
     fun updateRotation(rotation: Rotation) {
         currentWebView?.let { webView ->
             if (webView is RotatedWebView) {
@@ -144,20 +183,30 @@ class WebViewManager(
         webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
-                view.visibility = View.INVISIBLE
-                onPageLoading(true)
+                if (isSilentReload) {
+                    // Keep content visible during background polling reloads —
+                    // no black flash, no loading overlay.
+                    Log.d("WebViewManager", "onPageStarted (silent): $url")
+                } else {
+                    view.visibility = View.INVISIBLE
+                    onPageLoading(true)
+                }
             }
 
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
                 Log.d("WebViewManager", "onPageFinished: $url")
-                // Do NOT inject viewport here — it overrides the player page's own layout
-                // and can collapse the content area in complex SPAs.
-                // Viewport injection only happens on rotation via updateRotation().
-                view.postDelayed({
+                if (isSilentReload) {
+                    isSilentReload = false
                     view.visibility = View.VISIBLE
-                    onPageLoading(false)
-                }, 1000)
+                    Log.i("WebViewManager", "Silent reload complete — new content displayed")
+                    onSilentReloadComplete()
+                } else {
+                    view.postDelayed({
+                        view.visibility = View.VISIBLE
+                        onPageLoading(false)
+                    }, 1000)
+                }
             }
 
             @Suppress("DEPRECATION")

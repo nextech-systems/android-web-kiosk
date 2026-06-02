@@ -22,7 +22,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.foundation.Image
 import org.screenlite.webkiosk.data.KioskSettingsFactory
 import org.screenlite.webkiosk.data.Rotation
 
@@ -39,6 +42,7 @@ fun WebViewComponent(
     var isLoading by remember { mutableStateOf(true) }
     var hasError by remember { mutableStateOf(false) }
     var hasLoadedPage by remember { mutableStateOf(false) }
+    var snapshotBitmap by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
     var rotation: Rotation by remember { mutableStateOf(Rotation.ROTATION_0) }
     var retryCount by remember { mutableIntStateOf(0) }
     var retryTrigger by remember { mutableIntStateOf(0) }
@@ -61,7 +65,12 @@ fun WebViewComponent(
                     Log.d(TAG, "Page loaded successfully")
                 }
             }
-        )
+        ).also { manager ->
+            manager.onSilentReloadComplete = {
+                snapshotBitmap = null
+                Log.i(TAG, "Snapshot overlay removed — new content is live")
+            }
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -70,6 +79,22 @@ fun WebViewComponent(
             Log.d(TAG, "Rotation updated: $newRotation")
             rotation = newRotation
             webViewManager.updateRotation(newRotation)
+        }
+    }
+
+    // Polling: reload the player every 5 minutes so playlist changes are picked up
+    // without relying on the web app to push updates. Uses cache bypass so the
+    // server always returns fresh content rather than a stale cached response.
+    LaunchedEffect(hasLoadedPage) {
+        if (hasLoadedPage) {
+            while (true) {
+                delay(5 * 60 * 1000L) // 5 minutes
+                if (!hasError) {
+                    Log.i(TAG, "Polling reload — capturing snapshot and reloading silently")
+                    snapshotBitmap = webViewManager.captureSnapshot()
+                    webViewManager.reload()
+                }
+            }
         }
     }
 
@@ -163,6 +188,17 @@ fun WebViewComponent(
                         webView.reload()
                     }
                 })
+        }
+
+        // Snapshot overlay: shown during silent reloads so the screen never goes blank.
+        // The old frame stays visible until the new content is fully loaded.
+        snapshotBitmap?.let { bitmap ->
+            Image(
+                bitmap = bitmap.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.FillBounds
+            )
         }
 
         when {
