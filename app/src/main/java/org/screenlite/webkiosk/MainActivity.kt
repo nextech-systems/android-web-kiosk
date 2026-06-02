@@ -1,7 +1,10 @@
 package org.screenlite.webkiosk
 
 import android.app.Activity
+import android.app.ActivityManager
+import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.KeyEvent
@@ -51,6 +54,26 @@ class MainActivity : ComponentActivity() {
         // Process-level cache so activity restarts due to config changes
         // (e.g. keyboard appearing) can recover the URL without a new intent
         var cachedIntentUrl: String? = null
+
+        /**
+         * Move the web-kiosk task to the foreground.
+         * Called by StayOnTopService when it detects the activity has lost focus.
+         * Uses moveTaskToFront which works even on Android TV without a visible notification.
+         */
+        fun bringToFront(context: Context) {
+            try {
+                val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                @Suppress("DEPRECATION")
+                val tasks = am.getRunningTasks(20) ?: return
+                val kioskTask = tasks.firstOrNull {
+                    it.baseActivity?.packageName == context.packageName
+                } ?: return
+                am.moveTaskToFront(kioskTask.id, ActivityManager.MOVE_TASK_WITH_HOME)
+                Log.i("MainActivity", "moveTaskToFront called for task ${kioskTask.id}")
+            } catch (e: Exception) {
+                Log.e("MainActivity", "moveTaskToFront failed: ${e.message}")
+            }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -71,6 +94,13 @@ class MainActivity : ComponentActivity() {
 
         FullScreenHelper.enableImmersiveMode(this.window)
         StayOnTopServiceStarter.ensureRunning(this)
+
+        // Pin this activity to the foreground so the TV launcher can't steal focus.
+        // Works without device owner (shows a dismiss hint); fully silent when SDM
+        // has called setLockTaskPackages to whitelist org.screenlite.webkiosk.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            startLockTask()
+        }
 
         unlockHandler = TapUnlockHandler {
             openSettings()
