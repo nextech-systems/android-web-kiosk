@@ -102,9 +102,6 @@ class StayOnTopService : Service() {
      */
     private fun bringAppToFront() {
         Log.i("StayOnTopService", "Bringing app to front")
-        // Try moveTaskToFront first — works on TV without needing a visible notification
-        org.screenlite.webkiosk.MainActivity.bringToFront(this)
-        // Also fire the notification path as a belt-and-suspenders fallback
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             bringAppToFrontViaNotification()
         } else {

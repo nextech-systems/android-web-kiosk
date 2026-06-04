@@ -9,6 +9,7 @@ import android.view.View
 import android.webkit.*
 import android.webkit.WebView.setWebContentsDebuggingEnabled
 import androidx.annotation.RequiresApi
+import org.screenlite.webkiosk.app.FileLogger
 import org.screenlite.webkiosk.components.RotatedWebView
 import org.screenlite.webkiosk.data.Rotation
 import androidx.webkit.WebViewCompat
@@ -92,6 +93,7 @@ class WebViewManager(
             WebViewCompat.setWebViewRenderProcessClient(this, object : WebViewRenderProcessClient() {
                 override fun onRenderProcessUnresponsive(view: WebView, renderer: WebViewRenderProcess?) {
                     Log.e("WebViewManager", "Renderer unresponsive — terminating to recover")
+                    FileLogger.logRendererCrash()
                     renderer?.terminate()
                 }
                 override fun onRenderProcessResponsive(view: WebView, renderer: WebViewRenderProcess?) {
@@ -158,12 +160,24 @@ class WebViewManager(
         android.os.Handler(android.os.Looper.getMainLooper()).post {
             currentWebView?.let { webView ->
                 Log.i("WebViewManager", "Polling reload — clearing cache and reloading (silent)")
+                FileLogger.logPollingReload()
                 isSilentReload = true
                 webView.settings.cacheMode = WebSettings.LOAD_NO_CACHE
                 webView.reload()
                 webView.postDelayed({
                     webView.settings.cacheMode = WebSettings.LOAD_DEFAULT
                 }, 3000)
+                // Safety net: if onPageFinished never fires after the silent reload
+                // (e.g. Vite dev mode, network blip), force the WebView visible after 30s
+                // so the screen doesn't stay on a frozen snapshot or go white.
+                webView.postDelayed({
+                    if (isSilentReload) {
+                        FileLogger.logSilentReloadTimeout()
+                        isSilentReload = false
+                        webView.visibility = View.VISIBLE
+                        onSilentReloadComplete()
+                    }
+                }, 30_000)
             }
         }
     }
@@ -200,8 +214,10 @@ class WebViewManager(
                     isSilentReload = false
                     view.visibility = View.VISIBLE
                     Log.i("WebViewManager", "Silent reload complete — new content displayed")
+                    FileLogger.logSilentReloadComplete()
                     onSilentReloadComplete()
                 } else {
+                    FileLogger.logPageLoaded(url ?: "")
                     view.postDelayed({
                         view.visibility = View.VISIBLE
                         onPageLoading(false)

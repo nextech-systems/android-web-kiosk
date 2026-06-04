@@ -1,7 +1,7 @@
 package org.screenlite.webkiosk
 
 import android.app.Activity
-import android.app.ActivityManager
+import android.app.admin.DevicePolicyManager
 import android.content.Context
 import android.content.Intent
 import android.os.Build
@@ -34,10 +34,12 @@ import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.platform.LocalContext
+import org.screenlite.webkiosk.app.FileLogger
 import org.screenlite.webkiosk.app.FullScreenHelper
 import org.screenlite.webkiosk.app.IdleBrightnessController
 import org.screenlite.webkiosk.app.NotificationPermissionHelper
 import org.screenlite.webkiosk.app.StayOnTopServiceStarter
+import org.screenlite.webkiosk.service.StayOnTopService
 import org.screenlite.webkiosk.app.TapUnlockHandler
 import org.screenlite.webkiosk.components.MainScreen
 import org.screenlite.webkiosk.components.TouchKioskInputOverlay
@@ -55,25 +57,6 @@ class MainActivity : ComponentActivity() {
         // (e.g. keyboard appearing) can recover the URL without a new intent
         var cachedIntentUrl: String? = null
 
-        /**
-         * Move the web-kiosk task to the foreground.
-         * Called by StayOnTopService when it detects the activity has lost focus.
-         * Uses moveTaskToFront which works even on Android TV without a visible notification.
-         */
-        fun bringToFront(context: Context) {
-            try {
-                val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-                @Suppress("DEPRECATION")
-                val tasks = am.getRunningTasks(20) ?: return
-                val kioskTask = tasks.firstOrNull {
-                    it.baseActivity?.packageName == context.packageName
-                } ?: return
-                am.moveTaskToFront(kioskTask.id, ActivityManager.MOVE_TASK_WITH_HOME)
-                Log.i("MainActivity", "moveTaskToFront called for task ${kioskTask.id}")
-            } catch (e: Exception) {
-                Log.e("MainActivity", "moveTaskToFront failed: ${e.message}")
-            }
-        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -92,14 +75,23 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        FileLogger.init(this)
+        FileLogger.log("MainActivity onCreate — pid=${android.os.Process.myPid()}")
+
         FullScreenHelper.enableImmersiveMode(this.window)
         StayOnTopServiceStarter.ensureRunning(this)
 
-        // Pin this activity to the foreground so the TV launcher can't steal focus.
-        // Works without device owner (shows a dismiss hint); fully silent when SDM
-        // has called setLockTaskPackages to whitelist org.screenlite.webkiosk.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            startLockTask()
+        // Pin this activity only if SDM has whitelisted us as device owner.
+        // Without whitelisting, startLockTask() shows a system "Screen pinning" dialog
+        // that steals focus and leaves the screen blank on TV.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val dpm = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+            if (dpm.isLockTaskPermitted(packageName)) {
+                Log.i("MainActivity", "Lock task whitelisted — pinning activity")
+                startLockTask()
+            } else {
+                Log.i("MainActivity", "Lock task not whitelisted — skipping pin (SDM not device owner yet)")
+            }
         }
 
         unlockHandler = TapUnlockHandler {
@@ -149,12 +141,14 @@ class MainActivity : ComponentActivity() {
     override fun onPause() {
         super.onPause()
         idleController.stop()
+        StayOnTopService.isActivityVisible = false
     }
 
     override fun onResume() {
         super.onResume()
         idleController.start()
         FullScreenHelper.enableImmersiveMode(window)
+        StayOnTopService.isActivityVisible = true
     }
 }
 
