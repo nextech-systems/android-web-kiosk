@@ -4,9 +4,11 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
 import android.os.Build
+import android.provider.Settings
 import android.util.Log
 import android.view.View
 import android.webkit.*
+import android.webkit.JavascriptInterface
 import android.webkit.WebView.setWebContentsDebuggingEnabled
 import androidx.annotation.RequiresApi
 import org.screenlite.webkiosk.app.FileLogger
@@ -16,18 +18,157 @@ import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import androidx.webkit.WebViewRenderProcess
 import androidx.webkit.WebViewRenderProcessClient
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import java.net.Inet4Address
+import java.net.NetworkInterface
 
 class WebViewManager(
     private val context: Context,
     private val onError: (Boolean) -> Unit,
     private val onPageLoading: (Boolean) -> Unit
 ) {
+    companion object {
+        // Set to false to disable WebSocket monitoring entirely and always use
+        // the 5-minute polling fallback — no other code changes needed.
+        private const val WS_MONITOR_ENABLED = true
+    }
+
     private var currentWebView: WebView? = null
     private var isOfflineMode = false
     private var isSilentReload = false
 
+    // WebSocket connection state — observed by WebViewComponent to tune polling interval.
+    // true  = WS healthy → poll every 30 min (safety net only)
+    // false = WS down    → poll every 5 min (active fallback)
+    private val _isWebSocketConnected = MutableStateFlow(false)
+    val isWebSocketConnected: StateFlow<Boolean> = _isWebSocketConnected
+
     // Called when a silent reload completes — lets WebViewComponent remove the snapshot overlay
     var onSilentReloadComplete: () -> Unit = {}
+
+    /**
+     * JavaScript interface injected into the WebView so the player page's WebSocket
+     * activity can be observed from Android.  The injected JS wraps window.WebSocket
+     * and calls these methods on open/close/error.
+     *
+     * All methods are called on the JS thread — state updates are safe because
+     * MutableStateFlow is thread-safe.
+     */
+    inner class WebSocketBridge {
+        @JavascriptInterface
+        fun onOpen(url: String) {
+            Log.i("WebSocketBridge", "WebSocket connected: $url")
+            FileLogger.log("WebSocket OPEN: $url")
+            _isWebSocketConnected.value = true
+        }
+
+        @JavascriptInterface
+        fun onClose(url: String, code: Int, reason: String) {
+            Log.w("WebSocketBridge", "WebSocket closed: $url code=$code reason=$reason")
+            FileLogger.log("WebSocket CLOSED: $url code=$code reason=$reason", "W")
+            _isWebSocketConnected.value = false
+        }
+
+        @JavascriptInterface
+        fun onError(url: String) {
+            Log.e("WebSocketBridge", "WebSocket error: $url")
+            FileLogger.log("WebSocket ERROR: $url", "E")
+            _isWebSocketConnected.value = false
+        }
+    }
+
+    /**
+     * Provides device info to JavaScript so it can be included in the telemetry
+     * message sent to the server after auth_success.
+     */
+    inner class DeviceInfoBridge {
+        @JavascriptInterface
+        fun getSoftwareVersion(): String = try {
+            val info = context.packageManager.getPackageInfo(context.packageName, 0)
+            info.versionName ?: "unknown"
+        } catch (e: Exception) { "unknown" }
+
+        @JavascriptInterface
+        fun getPlatform(): String = "Android ${Build.VERSION.RELEASE} (${Build.MODEL})"
+
+        @JavascriptInterface
+        fun getTimezone(): String = java.util.TimeZone.getDefault().id
+
+        @JavascriptInterface
+        fun getLocalIpAddress(): String = try {
+            NetworkInterface.getNetworkInterfaces()
+                ?.asSequence()
+                ?.flatMap { it.inetAddresses.asSequence() }
+                ?.firstOrNull { !it.isLoopbackAddress && it is Inet4Address }
+                ?.hostAddress ?: ""
+        } catch (e: Exception) { "" }
+
+        @JavascriptInterface
+        fun getHostname(): String =
+            // User-visible device name (set in Settings → About → Device name)
+            Settings.Global.getString(context.contentResolver, "device_name")
+                ?: Build.MODEL
+
+        @JavascriptInterface
+        fun getMacAddress(): String = try {
+            // MAC address is restricted on Android 6+ for non-system apps;
+            // return empty string rather than the anonymised 02:00:00:00:00:00
+            val wlan = NetworkInterface.getByName("wlan0")
+            val bytes = wlan?.hardwareAddress
+            if (bytes != null && bytes.size == 6) {
+                bytes.joinToString(":") { "%02X".format(it) }
+            } else ""
+        } catch (e: Exception) { "" }
+    }
+
+    /** Injected after every page load to intercept WebSocket lifecycle events. */
+    private val wsMonitorScript = """
+        (function() {
+            if (window._androidWsMonitor) return;
+            window._androidWsMonitor = true;
+            var NativeWS = window.WebSocket;
+            window.WebSocket = function(url, protocols) {
+                var ws = protocols ? new NativeWS(url, protocols) : new NativeWS(url);
+                ws.addEventListener('open', function() {
+                    try { AndroidWS.onOpen(url); } catch(e) {}
+                });
+                ws.addEventListener('close', function(e) {
+                    try { AndroidWS.onClose(url, e.code || 0, e.reason || ''); } catch(e2) {}
+                });
+                ws.addEventListener('error', function() {
+                    try { AndroidWS.onError(url); } catch(e) {}
+                });
+                ws.addEventListener('message', function(event) {
+                    try {
+                        var msg = JSON.parse(event.data);
+                        if (msg.type === 'auth_success') {
+                            // Send device telemetry immediately after authentication
+                            var telemetry = {
+                                type: 'telemetry',
+                                data: {
+                                    softwareVersion: AndroidDevice.getSoftwareVersion(),
+                                    platform:        AndroidDevice.getPlatform(),
+                                    timezone:        AndroidDevice.getTimezone(),
+                                    localIpAddress:  AndroidDevice.getLocalIpAddress(),
+                                    publicIpAddress: '',
+                                    hostname:        AndroidDevice.getHostname(),
+                                    macAddress:      AndroidDevice.getMacAddress()
+                                }
+                            };
+                            ws.send(JSON.stringify(telemetry));
+                        }
+                    } catch(e) {}
+                });
+                return ws;
+            };
+            window.WebSocket.CONNECTING = NativeWS.CONNECTING;
+            window.WebSocket.OPEN      = NativeWS.OPEN;
+            window.WebSocket.CLOSING   = NativeWS.CLOSING;
+            window.WebSocket.CLOSED    = NativeWS.CLOSED;
+            window.WebSocket.prototype = NativeWS.prototype;
+        })();
+    """.trimIndent()
 
     /**
      * Captures the current WebView frame as a bitmap so it can be shown as an
@@ -80,6 +221,10 @@ class WebViewManager(
             requestFocus()
 
             configureWebViewSettings()
+            if (WS_MONITOR_ENABLED) {
+                addJavascriptInterface(WebSocketBridge(), "AndroidWS")
+                addJavascriptInterface(DeviceInfoBridge(), "AndroidDevice")
+            }
             setupWebViewListeners()
             setupRendererCrashHandler()
         }
@@ -162,6 +307,7 @@ class WebViewManager(
                 Log.i("WebViewManager", "Polling reload — clearing cache and reloading (silent)")
                 FileLogger.logPollingReload()
                 isSilentReload = true
+                _isWebSocketConnected.value = false  // will be restored once page reconnects
                 webView.settings.cacheMode = WebSettings.LOAD_NO_CACHE
                 webView.reload()
                 webView.postDelayed({
@@ -210,6 +356,12 @@ class WebViewManager(
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
                 Log.d("WebViewManager", "onPageFinished: $url")
+                // Inject WebSocket monitor so Android can track connection health.
+                // The script is idempotent (_androidWsMonitor guard) so repeated
+                // calls on silent reloads are safe.
+                if (WS_MONITOR_ENABLED) {
+                    view.evaluateJavascript(wsMonitorScript, null)
+                }
                 if (isSilentReload) {
                     isSilentReload = false
                     view.visibility = View.VISIBLE

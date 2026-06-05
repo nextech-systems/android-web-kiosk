@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -28,6 +29,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.foundation.Image
 import org.screenlite.webkiosk.data.KioskSettingsFactory
 import org.screenlite.webkiosk.data.Rotation
+
+// Polling intervals:
+//   WS connected    → 30 min safety-net reload (catches any edge-case WS drift)
+//   WS disconnected → 5 min active fallback reload
+private const val POLL_INTERVAL_WS_CONNECTED_MS    = 30 * 60 * 1000L
+private const val POLL_INTERVAL_WS_DISCONNECTED_MS =  5 * 60 * 1000L
 
 private const val TAG = "WebViewComponent"
 
@@ -47,6 +54,7 @@ fun WebViewComponent(
     var retryCount by remember { mutableIntStateOf(0) }
     var retryTrigger by remember { mutableIntStateOf(0) }
 
+    // Track WebSocket health — drives polling interval
     val webViewManager = remember {
         WebViewManager(
             activity,
@@ -72,6 +80,7 @@ fun WebViewComponent(
             }
         }
     }
+    val isWebSocketConnected by webViewManager.isWebSocketConnected.collectAsStateWithLifecycle()
 
     LaunchedEffect(Unit) {
         val kioskSettings = KioskSettingsFactory.get(context)
@@ -82,13 +91,25 @@ fun WebViewComponent(
         }
     }
 
-    // Polling: reload the player every 5 minutes so playlist changes are picked up
-    // without relying on the web app to push updates. Uses cache bypass so the
-    // server always returns fresh content rather than a stale cached response.
-    LaunchedEffect(hasLoadedPage) {
+    // Polling: reload the player periodically as a fallback for missed WebSocket updates.
+    // Interval adapts to WebSocket health:
+    //   WS connected    → 30 min (safety net only — WS pushes changes in real time)
+    //   WS disconnected → 5 min  (active fallback — catches any missed playlist changes)
+    // To disable WS monitoring entirely and always use 5 min, set WS_MONITOR_ENABLED=false
+    // in WebViewManager — no changes needed here.
+    // Re-key on isWebSocketConnected so the timer resets immediately when WS drops,
+    // rather than waiting out the remainder of a 30-min window.
+    LaunchedEffect(hasLoadedPage, isWebSocketConnected) {
         if (hasLoadedPage) {
             while (true) {
-                delay(5 * 60 * 1000L) // 5 minutes
+                val pollInterval = if (isWebSocketConnected) {
+                    Log.d(TAG, "WS connected — next poll in 30 min")
+                    POLL_INTERVAL_WS_CONNECTED_MS
+                } else {
+                    Log.d(TAG, "WS disconnected — next poll in 5 min (fallback)")
+                    POLL_INTERVAL_WS_DISCONNECTED_MS
+                }
+                delay(pollInterval)
                 if (!hasError) {
                     Log.i(TAG, "Polling reload — capturing snapshot and reloading silently")
                     snapshotBitmap = webViewManager.captureSnapshot()
