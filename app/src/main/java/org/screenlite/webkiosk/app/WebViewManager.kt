@@ -43,6 +43,13 @@ class WebViewManager(
     // Local media cache — downloads playlist files so they survive server outages
     val playlistCache = PlaylistCacheManager(context)
 
+    // Page cache — saves the player HTML and JS/CSS bundles so the player can start offline
+    private val pageCache = PageCacheManager(context.filesDir)
+
+    // True while the WebView is loading the player from the local page cache (cold-start offline).
+    // Prevents the normal error-handling path from firing again during loadDataWithBaseURL.
+    private var isServingFromPageCache = false
+
     // WebSocket connection state — observed by WebViewComponent to tune polling interval.
     // true  = WS healthy → poll every 30 min (safety net only)
     // false = WS down    → poll every 5 min (active fallback)
@@ -133,15 +140,34 @@ class WebViewManager(
 
     /**
      * Receives media URLs from the player JS so they can be pre-downloaded to local storage.
-     * The JS extracts all file URLs from the cached playlist in localStorage and calls
-     * onMediaUrls() after every auth_success — keeping the local cache in sync with the
-     * dashboard without requiring any server-side changes.
+     * Also receives all page asset URLs (JS/CSS) reported by performance.getEntriesByType()
+     * after the page finishes loading — used to keep the page cache warm for cold-start offline.
      */
     inner class AndroidCacheBridge {
         @JavascriptInterface
         fun onMediaUrls(urlsJson: String) {
             Log.i("AndroidCacheBridge", "Received media URLs for caching")
             playlistCache.onMediaUrls(urlsJson)
+        }
+
+        /**
+         * Called from JS after a successful page load with all resource URLs that the
+         * browser loaded (scripts, stylesheets, fonts).  We download and cache each one
+         * so the player can start from local storage when the server is offline at boot.
+         * Injected by the wsMonitorScript 8 seconds after onPageFinished.
+         */
+        @JavascriptInterface
+        fun onPageAssets(urlsJson: String) {
+            Log.i("AndroidCacheBridge", "Received page asset URLs for background caching")
+            try {
+                val arr = org.json.JSONArray(urlsJson)
+                val urls = (0 until arr.length()).map { arr.getString(it) }
+                val cookies = android.webkit.CookieManager.getInstance()
+                    .getCookie(lastLoadedUrl ?: "") ?: ""
+                pageCache.cacheAssets(urls, cookies)
+            } catch (e: Exception) {
+                Log.w("AndroidCacheBridge", "onPageAssets parse error: ${e.message}")
+            }
         }
     }
 
@@ -390,6 +416,32 @@ class WebViewManager(
     }
 
     /**
+     * Kicks off two background operations after a successful page load:
+     *  1. Immediately: fetch + cache the player HTML (so cold-boot recovery is always fresh).
+     *  2. After 8 s: inject JS to collect all loaded resource URLs (JS, CSS, fonts) and hand
+     *     them to AndroidCache.onPageAssets() for background download.
+     *     The 8-second delay lets dynamic import() calls finish before we query the resource list.
+     */
+    private fun scheduleCacheRefresh(view: WebView, pageUrl: String?) {
+        val url = pageUrl ?: return
+        val cookies = android.webkit.CookieManager.getInstance().getCookie(url) ?: ""
+        pageCache.fetchAndCacheHtml(url, cookies)
+
+        view.postDelayed({
+            view.evaluateJavascript("""
+                (function() {
+                    try {
+                        var urls = performance.getEntriesByType('resource')
+                            .filter(function(e) { return e.name.indexOf('/api/') === -1; })
+                            .map(function(e) { return e.name; });
+                        if (window.AndroidCache) AndroidCache.onPageAssets(JSON.stringify(urls));
+                    } catch(e) {}
+                })();
+            """.trimIndent(), null)
+        }, 8_000)
+    }
+
+    /**
      * Force the WebView visible and dismiss the loading overlay.
      * Called when onPageFinished hasn't fired within the timeout window —
      * e.g. Vite dev-mode pages that keep window.onload pending indefinitely.
@@ -483,18 +535,38 @@ class WebViewManager(
                     // Reset the flag and do nothing — do NOT reveal the error page.
                     silentReloadFailed = false
                     Log.d("WebViewManager", "onPageFinished after HTTP error during silent reload — ignoring")
+                } else if (isServingFromPageCache) {
+                    // We served the player HTML from local cache (cold-start offline).
+                    // Make the WebView visible and signal success — the player is running from cache.
+                    isServingFromPageCache = false
+                    view.postDelayed({
+                        view.visibility = View.VISIBLE
+                        onPageLoading(false)
+                    }, 1000)
+                    Log.i("WebViewManager", "Player loaded from page cache — running offline")
                 } else if (isSilentReload) {
                     isSilentReload = false
                     view.visibility = View.VISIBLE
-                    Log.i("WebViewManager", "Silent reload complete — new content displayed")
+                    Log.i("WebViewManager", "Silent reload complete — revealing new content shortly")
                     FileLogger.logSilentReloadComplete()
-                    onSilentReloadComplete()
+                    // Wait 2 s before removing the snapshot overlay.
+                    // onPageFinished fires when the HTML + JS are parsed, but the React app still
+                    // needs a render cycle before it paints a frame.  Without this delay the
+                    // snapshot disappears and the WebView shows a blank surface briefly.
+                    view.postDelayed({
+                        onSilentReloadComplete()
+                        Log.i("WebViewManager", "Snapshot overlay released — new content displayed")
+                    }, 2000)
+                    // Refresh the page cache so tonight's assets match what's currently deployed
+                    scheduleCacheRefresh(view, url)
                 } else {
                     FileLogger.logPageLoaded(url ?: "")
                     view.postDelayed({
                         view.visibility = View.VISIBLE
                         onPageLoading(false)
                     }, 1000)
+                    // Warm the page cache for cold-start offline capability
+                    scheduleCacheRefresh(view, url)
                 }
             }
 
@@ -505,17 +577,24 @@ class WebViewManager(
                     Log.w("WebViewManager", "Offline cache miss (legacy): $failingUrl — keeping last content")
                 } else if (isSilentReload) {
                     // Polling reload failed (e.g. server offline, DNS gone).
-                    // Hide the WebView so Chrome's error page isn't visible behind the snapshot.
-                    // Do NOT call onError() — the snapshot stays on screen until the next poll succeeds.
                     Log.w("WebViewManager", "Silent reload failed (legacy): $failingUrl code=$errorCode — keeping snapshot")
                     isSilentReload = false
                     view?.settings?.cacheMode = WebSettings.LOAD_DEFAULT
                     view?.visibility = View.INVISIBLE
                     onSilentReloadFailed()
-                } else {
+                } else if (!isServingFromPageCache) {
+                    // Initial load failed — try the page cache before showing the error overlay
                     Log.e("WebViewManager", "Legacy page failed: $failingUrl, code=$errorCode, desc=$description")
-                    onPageLoading(false)
-                    onError(true)
+                    val cached = pageCache.getCachedHtml(failingUrl ?: "")
+                    if (cached != null && view != null) {
+                        Log.i("WebViewManager", "Cold-start offline — serving player from page cache (legacy)")
+                        isServingFromPageCache = true
+                        val (bytes, _) = cached
+                        view.loadDataWithBaseURL(failingUrl, String(bytes), "text/html", "UTF-8", null)
+                    } else {
+                        onPageLoading(false)
+                        onError(true)
+                    }
                 }
                 super.onReceivedError(view, errorCode, description, failingUrl)
             }
@@ -527,49 +606,73 @@ class WebViewManager(
                         Log.w("WebViewManager", "Offline cache miss: ${request.url} — keeping last content")
                     } else if (isSilentReload) {
                         // Polling reload failed (e.g. server offline, DNS gone).
-                        // Hide the WebView so Chrome's error page isn't visible behind the snapshot.
-                        // Do NOT call onError() — the snapshot stays on screen until the next poll succeeds.
                         Log.w("WebViewManager", "Silent reload failed: ${request.url} code=${error.errorCode} — keeping snapshot")
                         isSilentReload = false
                         view.settings.cacheMode = WebSettings.LOAD_DEFAULT
                         view.visibility = View.INVISIBLE
                         onSilentReloadFailed()
-                    } else {
-                        onPageLoading(false)
-                        onError(true)
-                        Log.e(
-                            "WebViewManager",
-                            "Main page failed: ${request.url}, code=${error.errorCode}, desc=${error.description}"
-                        )
+                    } else if (!isServingFromPageCache) {
+                        // Initial load failed — try the page cache before showing the error overlay
+                        Log.e("WebViewManager", "Main page failed: ${request.url}, code=${error.errorCode}, desc=${error.description}")
+                        val failingUrl = request.url.toString()
+                        val cached = pageCache.getCachedHtml(failingUrl)
+                        if (cached != null) {
+                            Log.i("WebViewManager", "Cold-start offline — serving player from page cache")
+                            isServingFromPageCache = true
+                            val (bytes, contentType) = cached
+                            view.loadDataWithBaseURL(failingUrl, String(bytes), "text/html", "UTF-8", null)
+                        } else {
+                            onPageLoading(false)
+                            onError(true)
+                        }
                     }
-                } else {
-                    Log.w(
-                        "WebViewManager",
-                        "Subresource failed: ${request.url}, code=${error.errorCode}, desc=${error.description}"
-                    )
+                } else if (!isServingFromPageCache) {
+                    // Subresource failures during normal operation are expected when the server
+                    // goes down mid-session — just log them; the player handles this gracefully.
+                    Log.w("WebViewManager", "Subresource failed: ${request.url}, code=${error.errorCode}, desc=${error.description}")
                 }
             }
 
-            // Intercept media requests and serve from local cache when available.
-            // This makes the player fully offline-capable for any file that has been
-            // pre-downloaded by PlaylistCacheManager.
+            // Intercept requests and serve from local cache when available.
+            // Two caches work in tandem:
+            //   PlaylistCacheManager — serves media files (/api/file-delivery/stream/*)
+            //   PageCacheManager     — serves JS/CSS/font assets when loading from cached HTML
             override fun shouldInterceptRequest(
                 view: WebView,
                 request: WebResourceRequest
             ): WebResourceResponse? {
                 val url = request.url.toString()
+
+                // ── Media files ────────────────────────────────────────────────
                 if (url.contains("/api/file-delivery/stream/")) {
                     val rangeHeader = request.requestHeaders["Range"]
                     val response = playlistCache.serve(url, rangeHeader)
                     if (response != null) {
-                        Log.d("WebViewManager", "Cache hit: $url")
+                        Log.d("WebViewManager", "Cache hit (media): $url")
                         return response
                     }
-                    // Not in cache yet — let WebView fetch normally.
-                    // PlaylistCacheManager will download it in the background next time
-                    // auth_success fires so it's ready for the next outage.
-                    Log.d("WebViewManager", "Cache miss (serving live): $url")
+                    Log.d("WebViewManager", "Cache miss (media — serving live): $url")
+                    return super.shouldInterceptRequest(view, request)
                 }
+
+                // ── Page assets (JS, CSS, fonts) ───────────────────────────────
+                // Only intercept subresource requests when loading from the offline page cache
+                // (isServingFromPageCache = true, i.e. cold-start with server down).
+                // During normal live polling reloads we let the WebView fetch assets from the
+                // network as usual — intercepting them would make the page load faster but
+                // onPageFinished would then fire before React renders, causing a black flash
+                // when the snapshot overlay is removed.
+                if (request.method == "GET" && isServingFromPageCache) {
+                    val response = pageCache.serveAsset(url)
+                    if (response != null) {
+                        Log.d("WebViewManager", "Cache hit (asset): $url")
+                        return response
+                    }
+                    // Asset not cached yet — the request will fail (server is down) but the
+                    // player will continue working from whatever assets ARE in cache.
+                    Log.w("WebViewManager", "Cache miss during offline serve: $url")
+                }
+
                 return super.shouldInterceptRequest(view, request)
             }
 
@@ -590,9 +693,25 @@ class WebViewManager(
                     view.settings.cacheMode = WebSettings.LOAD_DEFAULT
                     view.visibility = View.INVISIBLE
                     onSilentReloadFailed()
-                } else if (request.isForMainFrame) {
-                    Log.w("WebViewManager", "HTTP error ${errorResponse.statusCode} on main frame: ${request.url}")
-                    // Not a silent reload — log only, don't disrupt normal load/error flow
+                } else if (request.isForMainFrame && !isServingFromPageCache) {
+                    val status = errorResponse.statusCode
+                    Log.w("WebViewManager", "HTTP error $status on main frame: ${request.url}")
+                    if (status >= 500) {
+                        // Server error on initial (non-silent) load — e.g. app restarted
+                        // while the backend is down (nginx returns 502).
+                        // Try the page cache first; fall back to the retry loop.
+                        val failingUrl = request.url.toString()
+                        val cached = pageCache.getCachedHtml(failingUrl)
+                        if (cached != null) {
+                            Log.i("WebViewManager", "Server error $status — serving player from page cache")
+                            isServingFromPageCache = true
+                            val (bytes, contentType) = cached
+                            view.loadDataWithBaseURL(failingUrl, String(bytes), "text/html", "UTF-8", null)
+                        } else {
+                            onPageLoading(false)
+                            onError(true)
+                        }
+                    }
                 }
             }
 
