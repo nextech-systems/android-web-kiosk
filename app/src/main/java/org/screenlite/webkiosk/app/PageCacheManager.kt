@@ -46,13 +46,6 @@ class PageCacheManager(cacheRoot: File) {
 
     companion object {
         private const val TAG = "PageCache"
-
-        // File extensions we cache. Covers everything a React/Vite SPA needs to run offline.
-        private val CACHEABLE_ASSET_EXTENSIONS = setOf(
-            "js", "mjs", "css",
-            "woff", "woff2", "ttf", "otf", "eot",
-            "svg", "ico", "png", "jpg", "jpeg", "webp", "gif"
-        )
     }
 
     private val cacheDir = File(cacheRoot, "page_cache").also { it.mkdirs() }
@@ -112,14 +105,16 @@ class PageCacheManager(cacheRoot: File) {
     }
 
     /**
-     * Enqueue background download of a list of asset URLs (JS, CSS, fonts, etc.).
+     * Enqueue background download of a list of resource URLs (JS, CSS, fonts, etc.).
+     * Any URL the browser loaded is worth caching -- we don't filter by extension so
+     * that Vite dev-server files like /@vite/client and /src/main.tsx are included.
      * Already-cached URLs are skipped. In-flight downloads are deduplicated.
      * Called from the JavascriptInterface after JS reports all loaded resource URLs.
      */
     fun cacheAssets(urls: List<String>, cookies: String) {
         var queued = 0
         for (url in urls) {
-            if (!isAssetUrl(url)) continue
+            if (!isCacheableRequest(url)) continue
             if (assetBodyFile(url).exists()) continue
             if (inFlight.putIfAbsent(url, true) != null) continue
             queued++
@@ -135,14 +130,14 @@ class PageCacheManager(cacheRoot: File) {
     }
 
     /**
-     * Returns a cached WebResourceResponse for a JS/CSS/font asset URL, or null if the
-     * asset is not in cache (WebView will fetch it from the network normally).
+     * Returns a cached WebResourceResponse for any URL that was previously cached, or null
+     * if not in cache (WebView will fetch it from the network normally).
      *
-     * HTML pages always return null -- they are served via loadDataWithBaseURL by
-     * WebViewManager, not through shouldInterceptRequest.
+     * The player HTML page itself is excluded -- it is served via loadDataWithBaseURL
+     * by WebViewManager, not through shouldInterceptRequest.
      */
     fun serveAsset(url: String): WebResourceResponse? {
-        if (!isAssetUrl(url)) return null
+        if (!isCacheableRequest(url)) return null
         val body = assetBodyFile(url)
         if (!body.exists()) return null
         val type = assetTypeFile(url)
@@ -200,16 +195,27 @@ class PageCacheManager(cacheRoot: File) {
         tmp.renameTo(file)
     }
 
-    private fun isAssetUrl(url: String): Boolean {
+    /**
+     * Returns true for any URL worth caching as a page asset.
+     *
+     * We deliberately do NOT filter by file extension so that Vite dev-server
+     * routes like /@vite/client and /src/main.tsx are included alongside the
+     * usual .js/.css/.woff bundles produced by production builds.
+     *
+     * Excluded:
+     *   data: URLs            -- inline content, nothing to download
+     *   /api/...              -- dynamic server responses, must not be cached
+     *   hot-update files      -- Vite HMR diffs, stale by next reload
+     *   /player/ paths        -- the HTML page itself, handled via loadDataWithBaseURL
+     *   non-HTTP(S) schemes   -- blob:, file:, etc.
+     */
+    private fun isCacheableRequest(url: String): Boolean {
+        if (url.startsWith("data:")) return false
+        if (!url.startsWith("http")) return false
         if (url.contains("/api/")) return false
         if (url.contains("hot-update")) return false
-        val path = try {
-            URL(url).path
-        } catch (e: Exception) {
-            return false
-        }
-        val ext = path.substringAfterLast(".").lowercase().take(10)
-        return ext in CACHEABLE_ASSET_EXTENSIONS
+        if (url.contains("/player/")) return false
+        return true
     }
 
     // Cache key for player HTML: use path only (no query string) so that token rotations
