@@ -37,6 +37,7 @@ class WebViewManager(
     private var currentWebView: WebView? = null
     private var isOfflineMode = false
     private var isSilentReload = false
+    private var lastLoadedUrl: String? = null
 
     // WebSocket connection state — observed by WebViewComponent to tune polling interval.
     // true  = WS healthy → poll every 30 min (safety net only)
@@ -46,6 +47,10 @@ class WebViewManager(
 
     // Called when a silent reload completes — lets WebViewComponent remove the snapshot overlay
     var onSilentReloadComplete: () -> Unit = {}
+
+    // Called when a silent (polling) reload fails due to network loss.
+    // WebViewComponent should keep the snapshot visible rather than showing an error screen.
+    var onSilentReloadFailed: () -> Unit = {}
 
     /**
      * JavaScript interface injected into the WebView so the player page's WebSocket
@@ -169,6 +174,27 @@ class WebViewManager(
             window.WebSocket.prototype = NativeWS.prototype;
         })();
     """.trimIndent()
+
+    /**
+     * Returns true if the server hosting the player page can be resolved via DNS.
+     * Called on a background thread (Dispatchers.IO) before each polling reload
+     * so that we never disturb playing content when the server is unreachable.
+     *
+     * Uses a plain DNS lookup (no HTTP request) — fast and zero server load.
+     * If DNS resolution fails the server is definitely unreachable; skip the reload.
+     */
+    fun isServerReachable(): Boolean {
+        val url = lastLoadedUrl ?: return true  // no URL yet → assume reachable
+        return try {
+            val hostname = java.net.URL(url).host
+            // getByName throws UnknownHostException when DNS fails (e.g. DDNS down)
+            java.net.InetAddress.getByName(hostname)
+            true
+        } catch (e: Exception) {
+            Log.w("WebViewManager", "Server DNS check failed — skipping poll: ${e.message}")
+            false
+        }
+    }
 
     /**
      * Captures the current WebView frame as a bitmap so it can be shown as an
@@ -316,12 +342,21 @@ class WebViewManager(
                 // Safety net: if onPageFinished never fires after the silent reload
                 // (e.g. Vite dev mode, network blip), force the WebView visible after 30s
                 // so the screen doesn't stay on a frozen snapshot or go white.
+                // If the WebView is INVISIBLE at this point, it means onReceivedError already
+                // hid it (network failure) — keep the snapshot up rather than revealing the
+                // Chrome error page.
                 webView.postDelayed({
                     if (isSilentReload) {
                         FileLogger.logSilentReloadTimeout()
                         isSilentReload = false
-                        webView.visibility = View.VISIBLE
-                        onSilentReloadComplete()
+                        if (webView.visibility == View.INVISIBLE) {
+                            // Network failure already handled — snapshot stays visible
+                            Log.w("WebViewManager", "Silent reload timeout — WebView hidden (network failure), keeping snapshot")
+                            onSilentReloadFailed()
+                        } else {
+                            webView.visibility = View.VISIBLE
+                            onSilentReloadComplete()
+                        }
                     }
                 }, 30_000)
             }
@@ -359,6 +394,7 @@ class WebViewManager(
                 // Inject WebSocket monitor so Android can track connection health.
                 // The script is idempotent (_androidWsMonitor guard) so repeated
                 // calls on silent reloads are safe.
+                lastLoadedUrl = url
                 if (WS_MONITOR_ENABLED) {
                     view.evaluateJavascript(wsMonitorScript, null)
                 }
@@ -382,6 +418,15 @@ class WebViewManager(
             override fun onReceivedError(view: WebView?, errorCode: Int, description: String?, failingUrl: String?) {
                 if (isOfflineMode) {
                     Log.w("WebViewManager", "Offline cache miss (legacy): $failingUrl — keeping last content")
+                } else if (isSilentReload) {
+                    // Polling reload failed (e.g. server offline, DNS gone).
+                    // Hide the WebView so Chrome's error page isn't visible behind the snapshot.
+                    // Do NOT call onError() — the snapshot stays on screen until the next poll succeeds.
+                    Log.w("WebViewManager", "Silent reload failed (legacy): $failingUrl code=$errorCode — keeping snapshot")
+                    isSilentReload = false
+                    view?.settings?.cacheMode = WebSettings.LOAD_DEFAULT
+                    view?.visibility = View.INVISIBLE
+                    onSilentReloadFailed()
                 } else {
                     Log.e("WebViewManager", "Legacy page failed: $failingUrl, code=$errorCode, desc=$description")
                     onPageLoading(false)
@@ -395,6 +440,15 @@ class WebViewManager(
                 if (request.isForMainFrame) {
                     if (isOfflineMode) {
                         Log.w("WebViewManager", "Offline cache miss: ${request.url} — keeping last content")
+                    } else if (isSilentReload) {
+                        // Polling reload failed (e.g. server offline, DNS gone).
+                        // Hide the WebView so Chrome's error page isn't visible behind the snapshot.
+                        // Do NOT call onError() — the snapshot stays on screen until the next poll succeeds.
+                        Log.w("WebViewManager", "Silent reload failed: ${request.url} code=${error.errorCode} — keeping snapshot")
+                        isSilentReload = false
+                        view.settings.cacheMode = WebSettings.LOAD_DEFAULT
+                        view.visibility = View.INVISIBLE
+                        onSilentReloadFailed()
                     } else {
                         onPageLoading(false)
                         onError(true)

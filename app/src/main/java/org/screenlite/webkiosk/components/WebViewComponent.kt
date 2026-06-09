@@ -13,7 +13,9 @@ import android.util.Log
 import org.screenlite.webkiosk.app.WebViewManager
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.viewinterop.AndroidView
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -49,6 +51,9 @@ fun WebViewComponent(
     var isLoading by remember { mutableStateOf(true) }
     var hasError by remember { mutableStateOf(false) }
     var hasLoadedPage by remember { mutableStateOf(false) }
+    // Once true, never goes back to false — prevents the black error/loading overlay
+    // from appearing after the first successful load (e.g. when server temporarily goes offline).
+    var hadSuccessfulLoad by remember { mutableStateOf(false) }
     var snapshotBitmap by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
     var rotation: Rotation by remember { mutableStateOf(Rotation.ROTATION_0) }
     var retryCount by remember { mutableIntStateOf(0) }
@@ -70,6 +75,7 @@ fun WebViewComponent(
                 Log.d(TAG, "Page loading=$loading")
                 if (!loading && !hasError) {
                     hasLoadedPage = true
+                    hadSuccessfulLoad = true
                     Log.d(TAG, "Page loaded successfully")
                 }
             }
@@ -77,6 +83,12 @@ fun WebViewComponent(
             manager.onSilentReloadComplete = {
                 snapshotBitmap = null
                 Log.i(TAG, "Snapshot overlay removed — new content is live")
+            }
+            manager.onSilentReloadFailed = {
+                // Network is down during a polling reload — keep the snapshot on screen.
+                // Do NOT clear snapshotBitmap; do NOT set hasError.
+                // The next polling cycle will try again automatically.
+                Log.w(TAG, "Silent reload failed — keeping snapshot until server is reachable again")
             }
         }
     }
@@ -111,9 +123,19 @@ fun WebViewComponent(
                 }
                 delay(pollInterval)
                 if (!hasError) {
-                    Log.i(TAG, "Polling reload — capturing snapshot and reloading silently")
-                    snapshotBitmap = webViewManager.captureSnapshot()
-                    webViewManager.reload()
+                    // DNS check on IO thread — if the server can't be resolved (offline,
+                    // DDNS down, etc.) we skip the reload entirely so the currently playing
+                    // content is never disturbed.
+                    val reachable = withContext(Dispatchers.IO) {
+                        webViewManager.isServerReachable()
+                    }
+                    if (reachable) {
+                        Log.i(TAG, "Polling reload — capturing snapshot and reloading silently")
+                        snapshotBitmap = webViewManager.captureSnapshot()
+                        webViewManager.reload()
+                    } else {
+                        Log.i(TAG, "Polling skipped — server unreachable, content continues playing")
+                    }
                 }
             }
         }
@@ -132,7 +154,10 @@ fun WebViewComponent(
     }
 
     LaunchedEffect(hasError, retryTrigger) {
-        if (hasError && !hasLoadedPage) {
+        // Only do the exponential-backoff WebView recreation if we have NEVER
+        // successfully loaded a page. After a successful load, the polling loop
+        // handles recovery — we must not recreate the WebView on every poll failure.
+        if (hasError && !hasLoadedPage && !hadSuccessfulLoad) {
             retryCount++
             val delayTime = (1000L * (1 shl (retryCount - 1))).coerceAtMost(30_000L)
             Log.d(TAG, "Retry #$retryCount in ${delayTime}ms (trigger=$retryTrigger)")
@@ -222,8 +247,11 @@ fun WebViewComponent(
             )
         }
 
+        // Only show the black overlay on initial load failures — never after a successful
+        // load. Once the player has displayed content, keep it (or the snapshot) visible
+        // even when the server is temporarily unreachable.
         when {
-            hasError -> Box(
+            hasError && !hadSuccessfulLoad -> Box(
                 Modifier
                     .fillMaxSize()
                     .background(Color.Black),
@@ -233,7 +261,7 @@ fun WebViewComponent(
                 Text("Connection error\nRetrying...", color = Color.White)
             }
 
-            isLoading -> Box(
+            isLoading && !hadSuccessfulLoad -> Box(
                 Modifier
                     .fillMaxSize()
                     .background(Color.Black),
