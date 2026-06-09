@@ -236,15 +236,34 @@ class WebViewManager(
      * Uses a plain DNS lookup (no HTTP request) — fast and zero server load.
      * If DNS resolution fails the server is definitely unreachable; skip the reload.
      */
+    /**
+     * Returns true only when the backend is fully healthy and a polling reload is safe.
+     *
+     * Performs a real HTTP GET to /api/health rather than a DNS-only lookup.
+     * This catches the "nginx up but Node.js backend down" case (502) — DNS resolves
+     * fine but a reload would get a 502 and kill the currently-playing content.
+     *
+     * If /api/health returns HTTP 200 → backend is healthy → reload.
+     * If it returns anything else (502, 503, timeout, DNS failure) → skip reload,
+     * keep the WebView visible and the player running from the local media cache.
+     */
     fun isServerReachable(): Boolean {
-        val url = lastLoadedUrl ?: return true  // no URL yet → assume reachable
+        val url = lastLoadedUrl ?: return true
         return try {
-            val hostname = java.net.URL(url).host
-            // getByName throws UnknownHostException when DNS fails (e.g. DDNS down)
-            java.net.InetAddress.getByName(hostname)
-            true
+            val parsed = java.net.URL(url)
+            val port = if (parsed.port != -1) ":${parsed.port}" else ""
+            val healthUrl = "${parsed.protocol}://${parsed.host}$port/api/health"
+            val conn = java.net.URL(healthUrl).openConnection() as java.net.HttpURLConnection
+            conn.connectTimeout = 5_000
+            conn.readTimeout   = 5_000
+            conn.requestMethod = "GET"
+            conn.connect()
+            val ok = conn.responseCode == 200
+            conn.disconnect()
+            if (!ok) Log.w("WebViewManager", "Health check returned ${conn.responseCode} — skipping poll")
+            ok
         } catch (e: Exception) {
-            Log.w("WebViewManager", "Server DNS check failed — skipping poll: ${e.message}")
+            Log.w("WebViewManager", "Health check failed — skipping poll: ${e.message}")
             false
         }
     }
