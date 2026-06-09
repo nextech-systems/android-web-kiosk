@@ -40,6 +40,9 @@ class WebViewManager(
     private var silentReloadFailed = false  // set by onReceivedHttpError; guards onPageFinished
     private var lastLoadedUrl: String? = null
 
+    // Local media cache — downloads playlist files so they survive server outages
+    val playlistCache = PlaylistCacheManager(context)
+
     // WebSocket connection state — observed by WebViewComponent to tune polling interval.
     // true  = WS healthy → poll every 30 min (safety net only)
     // false = WS down    → poll every 5 min (active fallback)
@@ -128,6 +131,20 @@ class WebViewManager(
         } catch (e: Exception) { "" }
     }
 
+    /**
+     * Receives media URLs from the player JS so they can be pre-downloaded to local storage.
+     * The JS extracts all file URLs from the cached playlist in localStorage and calls
+     * onMediaUrls() after every auth_success — keeping the local cache in sync with the
+     * dashboard without requiring any server-side changes.
+     */
+    inner class AndroidCacheBridge {
+        @JavascriptInterface
+        fun onMediaUrls(urlsJson: String) {
+            Log.i("AndroidCacheBridge", "Received media URLs for caching")
+            playlistCache.onMediaUrls(urlsJson)
+        }
+    }
+
     /** Injected after every page load to intercept WebSocket lifecycle events. */
     private val wsMonitorScript = """
         (function() {
@@ -163,6 +180,41 @@ class WebViewManager(
                                 }
                             };
                             ws.send(JSON.stringify(telemetry));
+
+                            // Extract all media URLs from the cached playlist in localStorage
+                            // and hand them to Android for background pre-download.
+                            // This runs after every auth_success so the cache stays in sync
+                            // whenever the dashboard makes a playlist change.
+                            try {
+                                var raw = localStorage.getItem('screenlite_cached_playlist');
+                                if (raw && window.AndroidCache) {
+                                    var mediaUrls = [];
+                                    function collectUrls(obj) {
+                                        if (!obj || typeof obj !== 'object') return;
+                                        // Player uses: getFileUrl(item.file.path)
+                                        // which expands to: origin + '/api/file-delivery/stream/' + path
+                                        if (obj.file && typeof obj.file.path === 'string' && obj.file.path.length > 0) {
+                                            mediaUrls.push(window.location.origin + '/api/file-delivery/stream/' + obj.file.path);
+                                        }
+                                        // Also catch bare path fields for other playlist shapes
+                                        if (!obj.file && typeof obj.path === 'string' && obj.path.length > 0) {
+                                            mediaUrls.push(window.location.origin + '/api/file-delivery/stream/' + obj.path);
+                                        }
+                                        var keys = Object.keys(obj);
+                                        for (var i = 0; i < keys.length; i++) { collectUrls(obj[keys[i]]); }
+                                    }
+                                    if (Array.isArray(JSON.parse(raw))) {
+                                        JSON.parse(raw).forEach(collectUrls);
+                                    } else {
+                                        collectUrls(JSON.parse(raw));
+                                    }
+                                    // Deduplicate
+                                    var unique = mediaUrls.filter(function(u, i, a) { return a.indexOf(u) === i; });
+                                    if (unique.length > 0) {
+                                        AndroidCache.onMediaUrls(JSON.stringify(unique));
+                                    }
+                                }
+                            } catch(cacheErr) {}
                         }
                     } catch(e) {}
                 });
@@ -257,6 +309,7 @@ class WebViewManager(
             if (WS_MONITOR_ENABLED) {
                 addJavascriptInterface(WebSocketBridge(), "AndroidWS")
                 addJavascriptInterface(DeviceInfoBridge(), "AndroidDevice")
+                addJavascriptInterface(AndroidCacheBridge(), "AndroidCache")
             }
             setupWebViewListeners()
             setupRendererCrashHandler()
@@ -476,6 +529,29 @@ class WebViewManager(
                         "Subresource failed: ${request.url}, code=${error.errorCode}, desc=${error.description}"
                     )
                 }
+            }
+
+            // Intercept media requests and serve from local cache when available.
+            // This makes the player fully offline-capable for any file that has been
+            // pre-downloaded by PlaylistCacheManager.
+            override fun shouldInterceptRequest(
+                view: WebView,
+                request: WebResourceRequest
+            ): WebResourceResponse? {
+                val url = request.url.toString()
+                if (url.contains("/api/file-delivery/stream/")) {
+                    val rangeHeader = request.requestHeaders["Range"]
+                    val response = playlistCache.serve(url, rangeHeader)
+                    if (response != null) {
+                        Log.d("WebViewManager", "Cache hit: $url")
+                        return response
+                    }
+                    // Not in cache yet — let WebView fetch normally.
+                    // PlaylistCacheManager will download it in the background next time
+                    // auth_success fires so it's ready for the next outage.
+                    Log.d("WebViewManager", "Cache miss (serving live): $url")
+                }
+                return super.shouldInterceptRequest(view, request)
             }
 
             // Catches HTTP-level errors (4xx/5xx) — e.g. 502 Bad Gateway when the Node.js
