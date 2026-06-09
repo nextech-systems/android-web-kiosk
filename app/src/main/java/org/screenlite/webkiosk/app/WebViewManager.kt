@@ -203,6 +203,12 @@ class WebViewManager(
      */
     fun captureSnapshot(): Bitmap? {
         val webView = currentWebView ?: return null
+        // Don't capture when WebView is hidden — it would produce a black bitmap
+        // (e.g. after a previous 502 failure) and replace the last good snapshot with black.
+        if (webView.visibility != View.VISIBLE) {
+            Log.w("WebViewManager", "Snapshot capture skipped — WebView not visible, keeping existing snapshot")
+            return null
+        }
         return try {
             val bitmap = Bitmap.createBitmap(webView.width, webView.height, Bitmap.Config.ARGB_8888)
             val canvas = android.graphics.Canvas(bitmap)

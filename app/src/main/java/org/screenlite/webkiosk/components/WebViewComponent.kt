@@ -131,7 +131,11 @@ fun WebViewComponent(
                     }
                     if (reachable) {
                         Log.i(TAG, "Polling reload — capturing snapshot and reloading silently")
-                        snapshotBitmap = webViewManager.captureSnapshot()
+                        // Only update the snapshot if we got a real frame.
+                        // captureSnapshot() returns null when the WebView is already hidden
+                        // (e.g. after a 502 failure) — keep the existing good snapshot in that case.
+                        val newSnapshot = webViewManager.captureSnapshot()
+                        if (newSnapshot != null) snapshotBitmap = newSnapshot
                         webViewManager.reload()
                     } else {
                         Log.i(TAG, "Polling skipped — server unreachable, content continues playing")
