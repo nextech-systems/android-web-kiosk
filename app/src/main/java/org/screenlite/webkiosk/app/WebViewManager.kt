@@ -37,6 +37,7 @@ class WebViewManager(
     private var currentWebView: WebView? = null
     private var isOfflineMode = false
     private var isSilentReload = false
+    private var silentReloadFailed = false  // set by onReceivedHttpError; guards onPageFinished
     private var lastLoadedUrl: String? = null
 
     // WebSocket connection state — observed by WebViewComponent to tune polling interval.
@@ -398,7 +399,13 @@ class WebViewManager(
                 if (WS_MONITOR_ENABLED) {
                     view.evaluateJavascript(wsMonitorScript, null)
                 }
-                if (isSilentReload) {
+                if (silentReloadFailed) {
+                    // onReceivedHttpError already handled this (e.g. 502 Bad Gateway during a
+                    // polling reload). The WebView is INVISIBLE and the snapshot is still shown.
+                    // Reset the flag and do nothing — do NOT reveal the error page.
+                    silentReloadFailed = false
+                    Log.d("WebViewManager", "onPageFinished after HTTP error during silent reload — ignoring")
+                } else if (isSilentReload) {
                     isSilentReload = false
                     view.visibility = View.VISIBLE
                     Log.i("WebViewManager", "Silent reload complete — new content displayed")
@@ -462,6 +469,29 @@ class WebViewManager(
                         "WebViewManager",
                         "Subresource failed: ${request.url}, code=${error.errorCode}, desc=${error.description}"
                     )
+                }
+            }
+
+            // Catches HTTP-level errors (4xx/5xx) — e.g. 502 Bad Gateway when the Node.js
+            // backend is down but nginx is still running. Unlike onReceivedError (network
+            // errors), this fires when the server responds with an error status code.
+            override fun onReceivedHttpError(
+                view: WebView,
+                request: WebResourceRequest,
+                errorResponse: WebResourceResponse
+            ) {
+                super.onReceivedHttpError(view, request, errorResponse)
+                if (request.isForMainFrame && isSilentReload) {
+                    val status = errorResponse.statusCode
+                    Log.w("WebViewManager", "Silent reload HTTP error $status: ${request.url} — keeping snapshot")
+                    isSilentReload = false
+                    silentReloadFailed = true   // tells onPageFinished not to reveal the error page
+                    view.settings.cacheMode = WebSettings.LOAD_DEFAULT
+                    view.visibility = View.INVISIBLE
+                    onSilentReloadFailed()
+                } else if (request.isForMainFrame) {
+                    Log.w("WebViewManager", "HTTP error ${errorResponse.statusCode} on main frame: ${request.url}")
+                    // Not a silent reload — log only, don't disrupt normal load/error flow
                 }
             }
 
