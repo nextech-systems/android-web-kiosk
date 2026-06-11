@@ -35,7 +35,13 @@ class StayOnTopService : Service() {
             if (isRunning) {
                 context.stopService(Intent(context, StayOnTopService::class.java))
             }
-            context.startService(Intent(context, StayOnTopService::class.java))
+            val intent = Intent(context, StayOnTopService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                @Suppress("DEPRECATION")
+                context.startService(intent)
+            }
         }
 
         private const val CHANNEL_ID = "kiosk_channel"
@@ -63,6 +69,12 @@ class StayOnTopService : Service() {
     override fun onCreate() {
         super.onCreate()
 
+        // Call startForeground() as the very first thing after super.onCreate().
+        // Android starts a 5-second countdown when startForegroundService() is called;
+        // any work done before startForeground() eats into that window.
+        // Under heavy system load at boot this window can expire if we do anything else first.
+        startForegroundCompat()
+
         val kioskSettings = KioskSettingsFactory.get(this)
 
         serviceScope.launch {
@@ -72,7 +84,6 @@ class StayOnTopService : Service() {
             }
         }
 
-        startForegroundService()
         handler.post(checkTask)
         isRunning = true
         Log.i("StayOnTopService", "Service created")
@@ -173,7 +184,7 @@ class StayOnTopService : Service() {
         }
     }
 
-    private fun startForegroundService() {
+    private fun startForegroundCompat() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundServiceOreo()
         } else {
