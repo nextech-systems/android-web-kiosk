@@ -418,37 +418,50 @@ class WebViewManager(
     /**
      * Kicks off two background operations after a successful page load:
      *  1. Immediately: fetch + cache the player HTML (so cold-boot recovery is always fresh).
-     *  2. After 8 s: inject JS to collect all loaded resource URLs (JS, CSS, fonts) and hand
-     *     them to AndroidCache.onPageAssets() for background download.
-     *     The 8-second delay lets dynamic import() calls finish before we query the resource list.
+     *  2. After 15 s and again after 45 s: inject JS to collect all loaded resource URLs
+     *     (JS, CSS, fonts) and hand them to AndroidCache.onPageAssets() for background download.
+     *     Two passes are needed because some routes (e.g. PlayerPage, auth API modules) are
+     *     lazily imported only AFTER authentication completes, which can take > 8 seconds.
+     *     cacheAssets() deduplicates, so running twice is safe.
      */
     private fun scheduleCacheRefresh(view: WebView, pageUrl: String?) {
         val url = pageUrl ?: return
         val cookies = android.webkit.CookieManager.getInstance().getCookie(url) ?: ""
         pageCache.fetchAndCacheHtml(url, cookies)
 
-        view.postDelayed({
-            view.evaluateJavascript("""
-                (function() {
-                    try {
-                        var urls = performance.getEntriesByType('resource')
-                            .filter(function(e) { return e.name.indexOf('/api/') === -1; })
-                            .map(function(e) { return e.name; });
-                        if (window.AndroidCache) AndroidCache.onPageAssets(JSON.stringify(urls));
-                    } catch(e) {}
-                })();
-            """.trimIndent(), null)
-        }, 8_000)
+        val collectScript = """
+            (function() {
+                try {
+                    var urls = performance.getEntriesByType('resource')
+                        .filter(function(e) { return e.name.indexOf('/api/') === -1; })
+                        .map(function(e) { return e.name; });
+                    if (window.AndroidCache) AndroidCache.onPageAssets(JSON.stringify(urls));
+                } catch(e) {}
+            })();
+        """.trimIndent()
+
+        // First pass — catches most static assets and early dynamic imports
+        view.postDelayed({ view.evaluateJavascript(collectScript, null) }, 15_000)
+        // Second pass — catches lazily-loaded route modules (PlayerPage, API clients, etc.)
+        // that only load after authentication and routing complete
+        view.postDelayed({ view.evaluateJavascript(collectScript, null) }, 45_000)
     }
 
     /**
      * Force the WebView visible and dismiss the loading overlay.
      * Called when onPageFinished hasn't fired within the timeout window —
      * e.g. Vite dev-mode pages that keep window.onload pending indefinitely.
+     *
+     * Must also clear isServingFromPageCache and isSilentReload: if onPageFinished
+     * never fires, those flags stay set and corrupt the next polling reload cycle.
      */
     fun forceShow() {
         android.os.Handler(android.os.Looper.getMainLooper()).post {
             Log.w("WebViewManager", "forceShow() — onPageFinished did not fire in time")
+            // Do NOT clear isServingFromPageCache here — scripts may still be loading
+            // from the local cache after the initial onPageFinished fired.
+            // It is cleared by the 10-second postDelayed scheduled in onPageFinished.
+            isSilentReload = false
             currentWebView?.visibility = android.view.View.VISIBLE
             onPageLoading(false)
         }
@@ -466,7 +479,18 @@ class WebViewManager(
                 isSilentReload = true
                 _isWebSocketConnected.value = false  // will be restored once page reconnects
                 webView.settings.cacheMode = WebSettings.LOAD_NO_CACHE
-                webView.reload()
+                // If the WebView is showing a data: URL (content served from page cache via
+                // loadDataWithBaseURL), webView.reload() just re-serves the same cached bytes
+                // and never contacts the server to check for recovery.
+                // In that case load the original player URL explicitly.
+                val currentUrl = webView.url
+                if (currentUrl != null && currentUrl.startsWith("data:")) {
+                    val targetUrl = lastLoadedUrl
+                    Log.i("WebViewManager", "Polling reload — current URL is data:, reloading original: $targetUrl")
+                    if (targetUrl != null) webView.loadUrl(targetUrl) else webView.reload()
+                } else {
+                    webView.reload()
+                }
                 webView.postDelayed({
                     webView.settings.cacheMode = WebSettings.LOAD_DEFAULT
                 }, 3000)
@@ -525,7 +549,12 @@ class WebViewManager(
                 // Inject WebSocket monitor so Android can track connection health.
                 // The script is idempotent (_androidWsMonitor guard) so repeated
                 // calls on silent reloads are safe.
-                lastLoadedUrl = url
+                // Do NOT store data: URLs — they come from loadDataWithBaseURL() serving
+                // cached HTML and must not overwrite the real player URL, which is needed
+                // by isServerReachable(), scheduleCacheRefresh(), and reload().
+                if (!url.isNullOrEmpty() && !url.startsWith("data:")) {
+                    lastLoadedUrl = url
+                }
                 if (WS_MONITOR_ENABLED) {
                     view.evaluateJavascript(wsMonitorScript, null)
                 }
@@ -536,13 +565,38 @@ class WebViewManager(
                     silentReloadFailed = false
                     Log.d("WebViewManager", "onPageFinished after HTTP error during silent reload — ignoring")
                 } else if (isServingFromPageCache) {
-                    // We served the player HTML from local cache (cold-start offline).
-                    // Make the WebView visible and signal success — the player is running from cache.
-                    isServingFromPageCache = false
+                    // We served the player HTML from local cache (cold-start or polling fallback).
+                    //
+                    // IMPORTANT: do NOT clear isServingFromPageCache here.
+                    // onPageFinished for loadDataWithBaseURL fires when the HTML is parsed —
+                    // BEFORE the browser fetches script/style subresources.  If we clear the
+                    // flag now, shouldInterceptRequest won't serve those assets from cache and
+                    // they will fail with net::ERR_FAILED (server is down).
+                    // Schedule the clear for 10 s — by then all scripts will have loaded.
                     view.postDelayed({
+                        if (isServingFromPageCache) {
+                            isServingFromPageCache = false
+                            Log.d("WebViewManager", "isServingFromPageCache cleared — script-serve window expired")
+                        }
+                    }, 10_000)
+
+                    if (isSilentReload) {
+                        // This was a polling reload that fell back to page cache because the
+                        // server is still down.  Release the snapshot overlay so the cached
+                        // player content is visible — but wait 2 s for React to paint first.
+                        isSilentReload = false
                         view.visibility = View.VISIBLE
-                        onPageLoading(false)
-                    }, 1000)
+                        view.postDelayed({
+                            onSilentReloadComplete()
+                            Log.i("WebViewManager", "Snapshot overlay released — page cache served during silent reload")
+                        }, 2000)
+                    } else {
+                        // Cold-start or initial load fell back to page cache.
+                        view.postDelayed({
+                            view.visibility = View.VISIBLE
+                            onPageLoading(false)
+                        }, 1000)
+                    }
                     Log.i("WebViewManager", "Player loaded from page cache — running offline")
                 } else if (isSilentReload) {
                     isSilentReload = false
@@ -663,6 +717,8 @@ class WebViewManager(
                 // onPageFinished would then fire before React renders, causing a black flash
                 // when the snapshot overlay is removed.
                 if (request.method == "GET" && isServingFromPageCache) {
+                    // data: URLs are inline content — not network requests, skip silently
+                    if (url.startsWith("data:")) return null
                     val response = pageCache.serveAsset(url)
                     if (response != null) {
                         Log.d("WebViewManager", "Cache hit (asset): $url")
